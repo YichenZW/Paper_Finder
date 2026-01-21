@@ -22,6 +22,15 @@ def get_collection(model_name: str, api_key: str):
     return client.get_collection(name=COLLECTION_NAME, embedding_function=embedding_fn)
 
 
+# Scoring weights for plain search relevance calculation
+TITLE_MATCH_BASE_SCORE = 0.5
+TITLE_POSITION_WEIGHT = 0.3
+TITLE_PROPORTION_WEIGHT = 0.2
+ABSTRACT_MATCH_BASE_SCORE = 0.3
+ABSTRACT_FREQUENCY_WEIGHT = 0.2
+ABSTRACT_MAX_BONUS = 0.4
+
+
 def plain_search(query_text, total_results=50):
     """
     Plain string matching search: searches titles first, then abstracts.
@@ -72,19 +81,25 @@ def plain_search(query_text, total_results=50):
             
             # Check for title match
             if query_lower in title.lower():
-                # Calculate a simple relevance score based on position and proportion
+                # Calculate relevance score: higher if match appears earlier and covers more of title
                 title_lower = title.lower()
                 match_position = title_lower.find(query_lower)
                 position_score = 1.0 - (match_position / max(len(title_lower), 1))
                 proportion_score = len(query_lower) / max(len(title_lower), 1)
-                record["similarity"] = round(0.5 + 0.3 * position_score + 0.2 * proportion_score, 4)
+                record["similarity"] = round(
+                    TITLE_MATCH_BASE_SCORE + TITLE_POSITION_WEIGHT * position_score + TITLE_PROPORTION_WEIGHT * proportion_score, 
+                    4
+                )
                 title_matches.append(record)
             # Check for abstract match (only if not already in title matches)
             elif query_lower in doc.lower() if doc else False:
-                # Lower score for abstract matches
+                # Lower score for abstract matches, bonus for multiple occurrences
                 abstract_lower = doc.lower()
                 match_count = abstract_lower.count(query_lower)
-                record["similarity"] = round(0.3 + min(0.2 * match_count, 0.4), 4)
+                record["similarity"] = round(
+                    ABSTRACT_MATCH_BASE_SCORE + min(ABSTRACT_FREQUENCY_WEIGHT * match_count, ABSTRACT_MAX_BONUS), 
+                    4
+                )
                 abstract_matches.append(record)
         
         # Sort each group by similarity score (descending)
@@ -218,12 +233,14 @@ with gr.Blocks(title="ICLR 2026 Paper Search") as demo:
     model_dropdown.change(toggle_key, inputs=model_dropdown, outputs=api_key_box)
 
     # hide/show embedding model options based on search mode
-    def toggle_embedding_options(mode):
+    def toggle_embedding_options(mode, current_model):
         if mode == "Plain Search":
             return gr.update(visible=False), gr.update(visible=False)
         else:
-            return gr.update(visible=True), gr.update(visible=False)  # api_key visibility handled by toggle_key
-    search_mode.change(toggle_embedding_options, inputs=search_mode, outputs=[model_dropdown, api_key_box])
+            # Show model dropdown, API key only if Gemini is selected
+            api_key_visible = (current_model == "gemini-embedding-001")
+            return gr.update(visible=True), gr.update(visible=api_key_visible)
+    search_mode.change(toggle_embedding_options, inputs=[search_mode, model_dropdown], outputs=[model_dropdown, api_key_box])
 
     def on_search(mode, model, key, q, total_res):
         if mode == "Plain Search":
