@@ -22,6 +22,89 @@ def get_collection(model_name: str, api_key: str):
     return client.get_collection(name=COLLECTION_NAME, embedding_function=embedding_fn)
 
 
+def plain_search(query_text, total_results=50):
+    """
+    Plain string matching search: searches titles first, then abstracts.
+    Returns papers sorted by relevance (title matches first, then abstract matches).
+    """
+    if not query_text.strip():
+        return None, "Please enter a query."
+    
+    try:
+        # Get all documents from the default collection
+        collection = get_collection("all-MiniLM-L6-v2", "")
+        # Get all documents (ChromaDB max is typically around 100k, we'll get a large number)
+        all_results = collection.get(limit=100000)
+        
+        docs = all_results["documents"]
+        metas = all_results["metadatas"]
+        ids = all_results["ids"]
+        
+        query_lower = query_text.lower().strip()
+        
+        title_matches = []
+        abstract_matches = []
+        
+        for doc_id, doc, meta in zip(ids, docs, metas):
+            title = meta.get("title", "Untitled")
+            keywords_raw = meta.get("keywords", "")
+            pdf = meta.get("pdf", "")
+            bibtex = meta.get("_bibtex", "")
+            
+            try:
+                if isinstance(keywords_raw, str) and keywords_raw.strip().startswith("["):
+                    keywords = ast.literal_eval(keywords_raw)
+                elif isinstance(keywords_raw, list):
+                    keywords = keywords_raw
+                else:
+                    keywords = [str(keywords_raw)]
+            except Exception:
+                keywords = [str(keywords_raw)]
+            
+            record = {
+                "title": title,
+                "keywords": keywords,
+                "pdf": pdf,
+                "abstract_md": doc.strip() if doc else "",
+                "bibtex": bibtex,
+                "similarity": 0.0  # Will be updated based on match quality
+            }
+            
+            # Check for title match
+            if query_lower in title.lower():
+                # Calculate a simple relevance score based on position and proportion
+                title_lower = title.lower()
+                match_position = title_lower.find(query_lower)
+                position_score = 1.0 - (match_position / max(len(title_lower), 1))
+                proportion_score = len(query_lower) / max(len(title_lower), 1)
+                record["similarity"] = round(0.5 + 0.3 * position_score + 0.2 * proportion_score, 4)
+                title_matches.append(record)
+            # Check for abstract match (only if not already in title matches)
+            elif query_lower in doc.lower() if doc else False:
+                # Lower score for abstract matches
+                abstract_lower = doc.lower()
+                match_count = abstract_lower.count(query_lower)
+                record["similarity"] = round(0.3 + min(0.2 * match_count, 0.4), 4)
+                abstract_matches.append(record)
+        
+        # Sort each group by similarity score (descending)
+        title_matches.sort(key=lambda x: x["similarity"], reverse=True)
+        abstract_matches.sort(key=lambda x: x["similarity"], reverse=True)
+        
+        # Combine: title matches first, then abstract matches
+        all_matches = title_matches + abstract_matches
+        
+        # Limit to requested number of results
+        limited_matches = all_matches[:int(total_results)]
+        
+        if not limited_matches:
+            return [], None
+        
+        return limited_matches, None
+    except Exception as e:
+        return None, f"Error: {e}"
+
+
 def query_db(model_name, api_key, query_text, total_results=50):
     if not query_text.strip():
         return None, "Please enter a query."
@@ -103,6 +186,12 @@ with gr.Blocks(title="ICLR 2026 Paper Search") as demo:
     gr.Markdown("Semantic search over ICLR 2026 submissions.")
 
     with gr.Accordion("Search Options", open=True) as search_box:
+        search_mode = gr.Radio(
+            label="Search Mode",
+            choices=["Semantic Search", "Plain Search"],
+            value="Semantic Search",
+            info="Semantic Search uses embeddings, Plain Search uses direct string matching"
+        )
         with gr.Row():
             model_dropdown = gr.Dropdown(
                 label="Embedding Model",
@@ -128,14 +217,26 @@ with gr.Blocks(title="ICLR 2026 Paper Search") as demo:
         return gr.update(visible=(model_name == "gemini-embedding-001"))
     model_dropdown.change(toggle_key, inputs=model_dropdown, outputs=api_key_box)
 
-    def on_search(model, key, q, total_res):
-        recs, err = query_db(model, key, q, total_res)
+    # hide/show embedding model options based on search mode
+    def toggle_embedding_options(mode):
+        if mode == "Plain Search":
+            return gr.update(visible=False), gr.update(visible=False)
+        else:
+            return gr.update(visible=True), gr.update(visible=False)  # api_key visibility handled by toggle_key
+    search_mode.change(toggle_embedding_options, inputs=search_mode, outputs=[model_dropdown, api_key_box])
+
+    def on_search(mode, model, key, q, total_res):
+        if mode == "Plain Search":
+            recs, err = plain_search(q, total_res)
+        else:
+            recs, err = query_db(model, key, q, total_res)
+        
         if err:
             return gr.update(open=True), f"<p style='color:red;'>{err}</p>", [], 1
         return gr.update(open=False), render_page(recs, 1), recs, 1
 
     search_btn.click(on_search,
-        inputs=[model_dropdown, api_key_box, query, total_results],
+        inputs=[search_mode, model_dropdown, api_key_box, query, total_results],
         outputs=[search_box, results_box, records_state, page_state])
 
     with gr.Row():
